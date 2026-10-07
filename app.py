@@ -1,23 +1,14 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 from pathlib import Path
+from sklearn.ensemble import IsolationForest
+from sklearn.preprocessing import OrdinalEncoder
 
 # ============================================================
 # SENTINEL-X
 # AI-Powered Attack DNA & Early Intervention Engine
 # ============================================================
-
-# -----------------------------
-# PROJECT PATH
-# -----------------------------
-
-PROJECT_FOLDER = Path(__file__).resolve().parent.parent
-CSV_FILE = PROJECT_FOLDER / "data" / "security_logs.csv"
-
-
-# -----------------------------
-# PAGE CONFIG
-# -----------------------------
 
 st.set_page_config(
     page_title="SENTINEL-X",
@@ -25,24 +16,80 @@ st.set_page_config(
     layout="wide"
 )
 
+# ============================================================
+# PATHS
+# ============================================================
 
-# -----------------------------
-# LOAD SECURITY LOGS
-# -----------------------------
+BASE_DIR = Path(__file__).resolve().parent
 
-@st.cache_data
-def load_data():
-    data = pd.read_csv(CSV_FILE)
-    data["Timestamp"] = pd.to_datetime(data["Timestamp"])
-    data = data.sort_values("Timestamp")
-    return data
+CSV_CANDIDATES = [
+    BASE_DIR / "data" / "security_logs.csv",
+    BASE_DIR / "security_logs.csv",
+    BASE_DIR.parent / "data" / "security_logs.csv",
+]
 
-
-df = load_data()
-
+CSV_FILE = next((p for p in CSV_CANDIDATES if p.exists()), None)
 
 # ============================================================
-# 1. EVENT CORRELATION + RISK ENGINE
+# HEADER
+# ============================================================
+
+st.title("🛡️ SENTINEL-X")
+st.subheader("AI-Powered Attack DNA & Early Intervention Engine")
+
+st.markdown(
+    """
+**SENTINEL-X** converts scattered security events into an interpretable
+attack story using behavioral anomaly detection, entity correlation,
+attack-chain reconstruction and evidence-based reasoning.
+"""
+)
+
+# ============================================================
+# LOAD DATA
+# ============================================================
+
+if CSV_FILE is None:
+    st.error("security_logs.csv was not found.")
+    st.info("Expected location: data/security_logs.csv")
+    st.stop()
+
+try:
+    df = pd.read_csv(CSV_FILE)
+except Exception as e:
+    st.error(f"Unable to read CSV: {e}")
+    st.stop()
+
+# ============================================================
+# VALIDATE DATA
+# ============================================================
+
+required_columns = [
+    "Timestamp",
+    "User_ID",
+    "Event_Type",
+    "Status",
+    "Device_ID",
+    "IP_Address",
+    "Application",
+    "Resource",
+]
+
+missing = [c for c in required_columns if c not in df.columns]
+
+if missing:
+    st.error(f"Missing required columns: {missing}")
+    st.stop()
+
+df["Timestamp"] = pd.to_datetime(df["Timestamp"], errors="coerce")
+df = df.dropna(subset=["Timestamp"]).sort_values("Timestamp").reset_index(drop=True)
+
+for col in required_columns:
+    if col != "Timestamp":
+        df[col] = df[col].fillna("Unknown").astype(str)
+
+# ============================================================
+# EVENT RISK MODEL
 # ============================================================
 
 event_scores = {
@@ -50,560 +97,644 @@ event_scores = {
     "File_Access": 15,
     "Privilege_Change": 25,
     "Data_Transfer": 30,
-    "Logout": 0
+    "Logout": 0,
 }
 
-df["Risk"] = df["Event_Type"].map(event_scores).fillna(0)
+df["Rule_Risk"] = df["Event_Type"].map(event_scores).fillna(5)
 
-# Failed login increases risk
-df.loc[df["Status"] == "Failed", "Risk"] += 10
+# Failed activity increases security risk
+df.loc[
+    df["Status"].str.lower().eq("failed"),
+    "Rule_Risk"
+] += 10
 
+# ============================================================
+# ML FEATURE ENGINEERING
+# ============================================================
 
-# Calculate risk for every user
-user_scores = df.groupby("User_ID")["Risk"].sum()
+df["Hour"] = df["Timestamp"].dt.hour
+df["DayOfWeek"] = df["Timestamp"].dt.dayofweek
 
-affected_user = user_scores.idxmax()
+df["User_Frequency"] = df.groupby("User_ID")["User_ID"].transform("count")
+df["Device_Frequency"] = df.groupby("Device_ID")["Device_ID"].transform("count")
+df["IP_Frequency"] = df.groupby("IP_Address")["IP_Address"].transform("count")
 
-risk_score = min(
-    int(user_scores.max()),
+categorical_columns = [
+    "Event_Type",
+    "Status",
+    "Application",
+    "Resource",
+]
+
+encoder = OrdinalEncoder(
+    handle_unknown="use_encoded_value",
+    unknown_value=-1
+)
+
+encoded = encoder.fit_transform(df[categorical_columns])
+
+encoded_df = pd.DataFrame(
+    encoded,
+    columns=[f"{c}_Encoded" for c in categorical_columns],
+    index=df.index,
+)
+
+features = pd.concat(
+    [
+        encoded_df,
+        df[
+            [
+                "Hour",
+                "DayOfWeek",
+                "User_Frequency",
+                "Device_Frequency",
+                "IP_Frequency",
+            ]
+        ],
+    ],
+    axis=1,
+)
+
+# ============================================================
+# ISOLATION FOREST
+# ============================================================
+
+if len(df) >= 5:
+
+    contamination = min(
+        max(0.15, 2 / len(df)),
+        0.30
+    )
+
+    model = IsolationForest(
+        n_estimators=150,
+        contamination=contamination,
+        random_state=42
+    )
+
+    model.fit(features)
+
+    raw_scores = -model.decision_function(features)
+
+    min_score = raw_scores.min()
+    max_score = raw_scores.max()
+
+    if max_score - min_score > 0:
+        anomaly_scores = (
+            (raw_scores - min_score)
+            / (max_score - min_score)
+        ) * 100
+    else:
+        anomaly_scores = np.full(len(df), 25.0)
+
+    df["ML_Anomaly"] = np.clip(
+        anomaly_scores,
+        0,
+        100
+    )
+
+    df["ML_Label"] = np.where(
+        df["ML_Anomaly"] >= 70,
+        "Anomalous",
+        "Normal"
+    )
+
+else:
+    df["ML_Anomaly"] = 25.0
+    df["ML_Label"] = "Insufficient Data"
+
+# ============================================================
+# HYBRID RISK
+# ============================================================
+
+df["Hybrid_Risk"] = (
+    0.65 * df["Rule_Risk"]
+    + 0.35 * df["ML_Anomaly"]
+)
+
+df["Hybrid_Risk"] = np.clip(
+    df["Hybrid_Risk"],
+    0,
     100
 )
 
-
-# Get events belonging to suspicious user
-user_events = df[
-    df["User_ID"] == affected_user
-].copy()
-
-
 # ============================================================
-# 2. ATTACK DNA
+# USER CORRELATION
 # ============================================================
 
-attack_sequence = user_events[
-    "Event_Type"
-].tolist()
+user_summary = (
+    df.groupby("User_ID")
+    .agg(
+        Total_Risk=("Hybrid_Risk", "sum"),
+        Events=("Event_Type", "count"),
+        Max_Risk=("Hybrid_Risk", "max"),
+        Anomaly_Average=("ML_Anomaly", "mean"),
+    )
+    .sort_values("Total_Risk", ascending=False)
+)
 
+affected_user = user_summary.index[0]
+
+user_df = df[df["User_ID"] == affected_user].copy()
+
+# Normalize total user risk
+user_score_raw = user_summary.loc[
+    affected_user,
+    "Total_Risk"
+]
+
+risk_score = int(
+    min(
+        100,
+        max(
+            0,
+            user_score_raw / max(len(user_df), 1)
+        )
+    )
+)
 
 # ============================================================
-# 3. ATTACK STAGE DETECTION
+# ATTACK DNA
 # ============================================================
 
-if "Data_Transfer" in attack_sequence:
+attack_sequence = user_df["Event_Type"].tolist()
 
-    current_stage = "Data Exfiltration"
-    predicted_stage = "Further Exfiltration / Persistence"
+stage_mapping = {
+    "Login": "Initial Access",
+    "File_Access": "Data Collection",
+    "Privilege_Change": "Privilege Escalation",
+    "Data_Transfer": "Data Exfiltration",
+    "Logout": "Session Termination",
+}
 
-elif "Privilege_Change" in attack_sequence:
+stage_sequence = [
+    stage_mapping.get(event, "Unknown Activity")
+    for event in attack_sequence
+]
 
-    current_stage = "Privilege Escalation"
-    predicted_stage = "Data Exfiltration"
+# Remove consecutive duplicates
+compressed_stages = []
 
-elif "File_Access" in attack_sequence:
-
-    current_stage = "Data Collection"
-    predicted_stage = "Privilege Escalation"
-
-else:
-
-    current_stage = "Initial Access"
-    predicted_stage = "Data Collection"
-
+for stage in stage_sequence:
+    if not compressed_stages or compressed_stages[-1] != stage:
+        compressed_stages.append(stage)
 
 # ============================================================
-# 4. THREAT LEVEL
+# CURRENT STAGE + NEXT STAGE
+# ============================================================
+
+stage_order = [
+    "Initial Access",
+    "Data Collection",
+    "Privilege Escalation",
+    "Data Exfiltration",
+    "Session Termination",
+]
+
+current_stage = (
+    compressed_stages[-1]
+    if compressed_stages
+    else "Unknown"
+)
+
+next_stage_map = {
+    "Initial Access": "Data Collection",
+    "Data Collection": "Privilege Escalation",
+    "Privilege Escalation": "Data Exfiltration",
+    "Data Exfiltration": "Further Exfiltration / Persistence",
+    "Session Termination": "No Immediate Next Stage",
+}
+
+predicted_stage = next_stage_map.get(
+    current_stage,
+    "Unknown"
+)
+
+# ============================================================
+# EVIDENCE ENGINE
+# ============================================================
+
+evidence = []
+
+failed_logins = user_df[
+    (user_df["Event_Type"] == "Login")
+    & (user_df["Status"].str.lower() == "failed")
+]
+
+file_access = user_df[
+    user_df["Event_Type"] == "File_Access"
+]
+
+privilege_changes = user_df[
+    user_df["Event_Type"] == "Privilege_Change"
+]
+
+transfers = user_df[
+    user_df["Event_Type"] == "Data_Transfer"
+]
+
+if len(failed_logins) > 0:
+    evidence.append(
+        f"{len(failed_logins)} failed login attempt(s) detected."
+    )
+
+if len(file_access) > 0:
+    evidence.append(
+        f"{len(file_access)} file/resource access event(s) detected."
+    )
+
+if len(privilege_changes) > 0:
+    evidence.append(
+        f"{len(privilege_changes)} privilege change event(s) detected."
+    )
+
+if len(transfers) > 0:
+    evidence.append(
+        f"{len(transfers)} data transfer event(s) detected."
+    )
+
+if user_df["ML_Anomaly"].max() >= 70:
+    evidence.append(
+        "ML anomaly detector identified unusual behavioral activity."
+    )
+
+if len(compressed_stages) >= 3:
+    evidence.append(
+        "Multiple security stages are connected in chronological order."
+    )
+
+if not evidence:
+    evidence.append(
+        "No strong suspicious evidence was identified."
+    )
+
+# ============================================================
+# CONFIDENCE
+# ============================================================
+
+sequence_strength = min(
+    len(compressed_stages) * 18,
+    100
+)
+
+ml_strength = float(
+    user_df["ML_Anomaly"].mean()
+)
+
+evidence_strength = min(
+    len(evidence) * 15,
+    100
+)
+
+entity_strength = 0
+
+if user_df["Device_ID"].nunique() >= 1:
+    entity_strength += 25
+
+if user_df["IP_Address"].nunique() >= 1:
+    entity_strength += 25
+
+if user_df["Application"].nunique() >= 1:
+    entity_strength += 25
+
+if user_df["Resource"].nunique() >= 1:
+    entity_strength += 25
+
+confidence = int(
+    np.clip(
+        (
+            sequence_strength
+            + ml_strength
+            + evidence_strength
+            + entity_strength
+        ) / 4,
+        0,
+        100,
+    )
+)
+
+# ============================================================
+# THREAT LEVEL
 # ============================================================
 
 if risk_score >= 80:
-
     threat_level = "CRITICAL"
-
 elif risk_score >= 60:
-
     threat_level = "HIGH"
-
-elif risk_score >= 30:
-
+elif risk_score >= 35:
     threat_level = "MEDIUM"
-
 else:
-
     threat_level = "LOW"
-
-
-# ============================================================
-# 5. EVIDENCE
-# ============================================================
-
-failed_logins = len(
-    user_events[
-        user_events["Status"] == "Failed"
-    ]
-)
-
-has_file_access = (
-    "File_Access" in attack_sequence
-)
-
-has_privilege_change = (
-    "Privilege_Change" in attack_sequence
-)
-
-has_data_transfer = (
-    "Data_Transfer" in attack_sequence
-)
-
-
-# ============================================================
-# MAIN HEADER
-# ============================================================
-
-st.title("🛡️ SENTINEL-X")
-
-st.subheader(
-    "AI-Powered Attack DNA & Early Intervention Engine"
-)
-
-st.write(
-    "SENTINEL-X correlates security events, reconstructs "
-    "attack progression, predicts the next stage and "
-    "identifies a possible intervention point."
-)
-
-st.divider()
-
 
 # ============================================================
 # TOP DASHBOARD
 # ============================================================
 
-col1, col2, col3, col4 = st.columns(4)
+st.divider()
 
-with col1:
+c1, c2, c3, c4, c5 = st.columns(5)
 
-    st.metric(
-        "🚨 Threat Level",
-        threat_level
-    )
+c1.metric(
+    "Threat Level",
+    threat_level
+)
 
-with col2:
+c2.metric(
+    "Hybrid Risk",
+    f"{risk_score}/100"
+)
 
-    st.metric(
-        "📊 Risk Score",
-        f"{risk_score}/100"
-    )
+c3.metric(
+    "ML Anomaly",
+    f"{user_df['ML_Anomaly'].mean():.0f}/100"
+)
 
-with col3:
+c4.metric(
+    "Confidence",
+    f"{confidence}%"
+)
 
-    st.metric(
-        "📈 Current Stage",
-        current_stage
-    )
+c5.metric(
+    "Affected User",
+    str(affected_user)
+)
 
-with col4:
-
-    st.metric(
-        "👤 Affected User",
-        affected_user
-    )
-
+# ============================================================
+# PIPELINE
+# ============================================================
 
 st.divider()
 
+st.header("🔬 Detection Pipeline")
 
-# ============================================================
-# 6. ATTACK DNA
-# ============================================================
+pipeline = [
+    "Raw Logs",
+    "Event Processing",
+    "ML Anomaly",
+    "Entity Correlation",
+    "Attack Reconstruction",
+    "Attack DNA",
+    "Prediction",
+    "Intervention",
+]
 
-st.header("🧬 Attack DNA")
+cols = st.columns(len(pipeline))
 
-st.write(
-    "Observed sequence of suspicious activity:"
-)
-
-dna = " → ".join(
-    attack_sequence
-)
-
-st.code(
-    dna,
-    language="text"
-)
-
-
-# ============================================================
-# 7. ATTACK PROGRESSION
-# ============================================================
-
-st.header("📈 Attack Progression")
-
-col1, col2 = st.columns(2)
-
-with col1:
-
-    st.info(
-        f"CURRENT STAGE\n\n"
-        f"### {current_stage}"
+for col, step in zip(cols, pipeline):
+    col.markdown(
+        f"**{step}**"
     )
 
-with col2:
-
-    st.warning(
-        f"PREDICTED NEXT STAGE\n\n"
-        f"### {predicted_stage}"
-    )
-
+# ============================================================
+# ML EVIDENCE
+# ============================================================
 
 st.divider()
 
+st.header("🤖 ML Behavioral Analysis")
 
-# ============================================================
-# 8. EVIDENCE & EXPLAINABILITY
-# ============================================================
-
-st.header("🔎 Evidence & Explanation")
-
-evidence_count = 0
-
-if failed_logins >= 2:
-
-    st.success(
-        "✓ Multiple failed login attempts detected"
-    )
-
-    evidence_count += 1
-
-
-if has_file_access:
-
-    st.success(
-        "✓ Sensitive file access detected"
-    )
-
-    evidence_count += 1
-
-
-if has_privilege_change:
-
-    st.success(
-        "✓ Privilege change detected"
-    )
-
-    evidence_count += 1
-
-
-if has_data_transfer:
-
-    st.success(
-        "✓ Data transfer detected"
-    )
-
-    evidence_count += 1
-
-
-st.write(
-    f"**{evidence_count} suspicious signals contributed "
-    f"to the current assessment.**"
-)
-
-
-st.divider()
-
-
-# ============================================================
-# 9. LIVING ATTACK GRAPH
-# ============================================================
-
-st.header("🕸️ Living Attack Graph")
-
-st.write(
-    "Relationship between the user, device, IP address, "
-    "applications and resources involved in the attack."
-)
-
-
-device = user_events[
-    "Device_ID"
-].iloc[0]
-
-ip_address = user_events[
-    "IP_Address"
-].iloc[0]
-
-
-# Graphviz diagram
-dot = f"""
-digraph AttackGraph {{
-
-    graph [
-        rankdir=LR,
-        bgcolor="transparent"
-    ];
-
-    node [
-        shape=box,
-        style="rounded,filled",
-        fontname="Arial"
-    ];
-
-    User [
-        label="👤 USER\\n{affected_user}"
-    ];
-
-    Device [
-        label="💻 DEVICE\\n{device}"
-    ];
-
-    IP [
-        label="🌐 IP\\n{ip_address}"
-    ];
-
-    User -> Device;
-    Device -> IP;
-"""
-
-
-# Applications
-applications = list(
-    user_events["Application"]
-    .dropna()
-    .unique()
-)
-
-for i, application in enumerate(applications):
-
-    node_id = f"App{i}"
-
-    dot += f"""
-    {node_id} [
-        label="📱 {application}"
-    ];
-
-    IP -> {node_id};
-    """
-
-
-# Resources
-resources = list(
-    user_events["Resource"]
-    .dropna()
-    .unique()
-)
-
-for i, resource in enumerate(resources):
-
-    if resource == "-":
-        continue
-
-    node_id = f"Resource{i}"
-
-    dot += f"""
-    {node_id} [
-        label="📄 {resource}"
-    ];
-    """
-
-
-# Connect applications to resources
-for i, resource in enumerate(resources):
-
-    if resource == "-":
-        continue
-
-    matching = user_events[
-        user_events["Resource"] == resource
-    ]
-
-    if matching.empty:
-        continue
-
-    application = matching[
-        "Application"
-    ].iloc[0]
-
-    if application in applications:
-
-        app_index = applications.index(
-            application
-        )
-
-        dot += f"""
-        App{app_index} -> Resource{i};
-        """
-
-
-dot += """
-}
-"""
-
-
-st.graphviz_chart(
-    dot,
-    use_container_width=True
-)
-
-
-st.divider()
-
-
-# ============================================================
-# 10. ATTACK REPLAY
-# ============================================================
-
-st.header("🎬 Attack Replay")
-
-st.write(
-    "Replay the reconstructed attack sequence."
-)
-
-
-if "replay_started" not in st.session_state:
-
-    st.session_state.replay_started = False
-
-
-if st.button(
-    "▶ Start Attack Replay"
-):
-
-    st.session_state.replay_started = True
-
-
-if st.session_state.replay_started:
-
-    for _, event in user_events.iterrows():
-
-        st.write(
-            f"**{event['Timestamp'].strftime('%H:%M:%S')}**"
-            f" — {event['Event_Type']}"
-        )
-
-
-st.divider()
-
-
-# ============================================================
-# 11. COUNTERFACTUAL DEFENSE
-# ============================================================
-
-st.header("🔀 Counterfactual Defense")
-
-st.write(
-    "Simulate where the attack chain could be disrupted."
-)
-
-col1, col2, col3, col4 = st.columns(4)
-
-
-with col1:
-
-    isolate = st.button(
-        "🛑 Isolate Device"
-    )
-
-
-with col2:
-
-    block_ip = st.button(
-        "🚫 Block IP"
-    )
-
-
-with col3:
-
-    disable_user = st.button(
-        "👤 Disable User"
-    )
-
-
-with col4:
-
-    block_transfer = st.button(
-        "📦 Block Data Transfer"
-    )
-
-
-if isolate:
-
-    st.success(
-        f"SIMULATION: Device {device} isolated."
-    )
-
-    st.metric(
-        "Simulated Risk",
-        "45/100"
-    )
-
-    st.write(
-        "The simulated intervention breaks the "
-        "device-to-data-transfer path."
-    )
-
-
-if block_ip:
-
-    st.success(
-        f"SIMULATION: IP {ip_address} blocked."
-    )
-
-    st.metric(
-        "Simulated Risk",
-        "40/100"
-    )
-
-
-if disable_user:
-
-    st.success(
-        f"SIMULATION: User {affected_user} disabled."
-    )
-
-    st.metric(
-        "Simulated Risk",
-        "35/100"
-    )
-
-
-if block_transfer:
-
-    st.success(
-        "SIMULATION: Data transfer blocked."
-    )
-
-    st.metric(
-        "Simulated Risk",
-        "30/100"
-    )
-
-
-st.caption(
-    "⚠️ Counterfactual defense actions are simulated "
-    "and do not execute real security controls."
-)
-
-
-st.divider()
-
-
-# ============================================================
-# 12. SECURITY EVENT TIMELINE
-# ============================================================
-
-st.header("⏱️ Security Event Timeline")
-
-timeline = user_events[
+ml_display = user_df[
     [
         "Timestamp",
-        "User_ID",
-        "Device_ID",
-        "IP_Address",
         "Event_Type",
-        "Application",
-        "Resource",
-        "Status"
+        "Status",
+        "ML_Anomaly",
+        "ML_Label",
+        "Rule_Risk",
+        "Hybrid_Risk",
     ]
 ].copy()
 
+ml_display["ML_Anomaly"] = (
+    ml_display["ML_Anomaly"].round(1)
+)
+
+ml_display["Rule_Risk"] = (
+    ml_display["Rule_Risk"].round(1)
+)
+
+ml_display["Hybrid_Risk"] = (
+    ml_display["Hybrid_Risk"].round(1)
+)
+
+st.dataframe(
+    ml_display,
+    use_container_width=True,
+    hide_index=True
+)
+
+st.caption(
+    "ML anomaly score is a behavioral anomaly indicator, "
+    "not a calibrated probability of attack."
+)
+
+# ============================================================
+# ENTITY CORRELATION
+# ============================================================
+
+st.divider()
+
+st.header("🔗 Entity Correlation")
+
+e1, e2, e3, e4, e5 = st.columns(5)
+
+e1.metric(
+    "User",
+    str(affected_user)
+)
+
+e2.metric(
+    "Device",
+    str(user_df["Device_ID"].mode().iloc[0])
+)
+
+e3.metric(
+    "IP Address",
+    str(user_df["IP_Address"].mode().iloc[0])
+)
+
+e4.metric(
+    "Application",
+    str(user_df["Application"].mode().iloc[0])
+)
+
+e5.metric(
+    "Resource",
+    str(user_df["Resource"].mode().iloc[0])
+)
+
+st.code(
+    f"""
+User
+  ↓
+{user_df["Device_ID"].mode().iloc[0]}
+  ↓
+{user_df["IP_Address"].mode().iloc[0]}
+  ↓
+{user_df["Application"].mode().iloc[0]}
+  ↓
+{user_df["Resource"].mode().iloc[0]}
+"""
+)
+
+# ============================================================
+# ATTACK DNA
+# ============================================================
+
+st.divider()
+
+st.header("🧬 Attack DNA")
+
+st.subheader("Observed Event Sequence")
+
+st.write(
+    " → ".join(attack_sequence)
+)
+
+st.subheader("Semantic Attack Sequence")
+
+st.write(
+    " → ".join(compressed_stages)
+)
+
+# ============================================================
+# ATTACK PROGRESSION
+# ============================================================
+
+st.divider()
+
+st.header("📈 Attack Progression")
+
+p1, p2 = st.columns(2)
+
+with p1:
+    st.metric(
+        "Current Stage",
+        current_stage
+    )
+
+with p2:
+    st.metric(
+        "Predicted Next Stage",
+        predicted_stage
+    )
+
+st.progress(
+    min(
+        len(compressed_stages) / max(len(stage_order), 1),
+        1.0
+    )
+)
+
+# ============================================================
+# EVIDENCE
+# ============================================================
+
+st.divider()
+
+st.header("🔎 Why is this suspicious?")
+
+for item in evidence:
+    st.success("✓ " + item)
+
+# ============================================================
+# INTERVENTION
+# ============================================================
+
+st.divider()
+
+st.header("🚨 Early Intervention")
+
+if current_stage == "Initial Access":
+    recommendation = "Strengthen authentication / temporarily lock the account."
+elif current_stage == "Data Collection":
+    recommendation = "Restrict sensitive resource access and investigate the endpoint."
+elif current_stage == "Privilege Escalation":
+    recommendation = "Disable or isolate the affected account/device."
+elif current_stage == "Data Exfiltration":
+    recommendation = "Block suspicious outbound transfer and isolate the endpoint."
+else:
+    recommendation = "Continue monitoring and investigate correlated activity."
+
+st.warning(
+    f"Recommended intervention: **{recommendation}**"
+)
+
+st.caption(
+    "This is a recommendation/simulation only. "
+    "SENTINEL-X does not execute real security controls."
+)
+
+# ============================================================
+# WHAT-IF SIMULATION
+# ============================================================
+
+st.divider()
+
+st.header("🧪 Counterfactual Defense Simulation")
+
+action = st.selectbox(
+    "Select an intervention:",
+    [
+        "Isolate Device",
+        "Block IP",
+        "Disable User",
+        "Block Data Transfer",
+    ]
+)
+
+if st.button("Run What-If Simulation"):
+
+    st.info(
+        f"Simulating intervention: **{action}**"
+    )
+
+    st.write(
+        "Without intervention:"
+    )
+
+    st.code(
+        "Current Stage → "
+        + current_stage
+        + " → "
+        + predicted_stage
+    )
+
+    st.write(
+        "With intervention:"
+    )
+
+    st.success(
+        f"{current_stage} → [{action}] → Attack progression interrupted"
+    )
+
+# ============================================================
+# TIMELINE
+# ============================================================
+
+st.divider()
+
+st.header("⏱️ Attack Timeline")
+
+timeline = user_df[
+    [
+        "Timestamp",
+        "Event_Type",
+        "Status",
+        "Device_ID",
+        "IP_Address",
+        "ML_Anomaly",
+        "Hybrid_Risk",
+    ]
+].copy()
+
+timeline["ML_Anomaly"] = (
+    timeline["ML_Anomaly"].round(1)
+)
+
+timeline["Hybrid_Risk"] = (
+    timeline["Hybrid_Risk"].round(1)
+)
 
 st.dataframe(
     timeline,
@@ -611,32 +742,75 @@ st.dataframe(
     hide_index=True
 )
 
+# ============================================================
+# NORMAL VS SUSPICIOUS
+# ============================================================
 
 st.divider()
 
+st.header("⚖️ Behavioral Comparison")
+
+normal_events = [
+    "Login",
+    "File_Access",
+    "Logout",
+]
+
+suspicious_events = attack_sequence
+
+comparison = pd.DataFrame(
+    {
+        "Normal Pattern": pd.Series(normal_events),
+        "Observed Pattern": pd.Series(suspicious_events),
+    }
+)
+
+st.dataframe(
+    comparison,
+    use_container_width=True,
+    hide_index=True
+)
 
 # ============================================================
-# FINAL SUMMARY
+# FINAL ANALYSIS
 # ============================================================
+
+st.divider()
 
 st.header("🧠 SENTINEL-X Analysis")
 
-st.write(
-    f"SENTINEL-X identified **{affected_user}** as the "
-    f"highest-risk user with a score of **{risk_score}/100**. "
-    f"The observed activity progressed to "
-    f"**{current_stage}**."
+st.markdown(
+    f"""
+**Affected User:** `{affected_user}`
+
+**Threat Level:** `{threat_level}`
+
+**Current Stage:** `{current_stage}`
+
+**Predicted Next Stage:** `{predicted_stage}`
+
+**Hybrid Risk:** `{risk_score}/100`
+
+**ML Behavioral Anomaly:** `{user_df["ML_Anomaly"].mean():.0f}/100`
+
+**Prototype Evidence Confidence:** `{confidence}%`
+
+The system combines deterministic security semantics with behavioral
+anomaly detection. Related events are correlated through shared
+entities and chronological order to reconstruct an attack chain.
+
+The resulting Attack DNA provides an interpretable representation of
+how the activity progressed and identifies an intervention point before
+the predicted next stage.
+"""
 )
-
-st.write(
-    f"The prototype predicts **{predicted_stage}** as the "
-    f"next possible stage and recommends intervention "
-    f"before additional malicious activity occurs."
-)
-
-
-st.divider()
 
 st.caption(
-    "SENTINEL-X — Cyber Threat Intelligence Prototype"
+    "SENTINEL-X is an evaluation prototype. "
+    "Confidence values represent prototype evidence strength and are "
+    "not calibrated probabilities."
+)
+
+st.success(
+    "SENTINEL-X analysis complete."
 )
