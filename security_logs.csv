@@ -1,0 +1,21 @@
+Timestamp,User_ID,Device_ID,IP_Address,Event_Type,Application,Resource,Status
+2026-10-07 10:15:22,U101,D205,192.168.1.20,Login,VPN,-,Success
+2026-10-07 10:16:05,U101,D205,192.168.1.20,File_Access,FileServer,Finance_Report.pdf,Success
+2026-10-07 10:18:11,U102,D206,192.168.1.21,Login,VPN,-,Success
+2026-10-07 10:20:32,U103,D207,192.168.1.22,Login,Email,-,Success
+2026-10-07 10:22:14,U102,D206,192.168.1.21,File_Access,FileServer,Project_Plan.docx,Success
+2026-10-07 10:25:43,U104,D208,192.168.1.23,Login,VPN,-,Success
+2026-10-07 10:27:18,U103,D207,192.168.1.22,File_Access,FileServer,HR_Policy.pdf,Success
+2026-10-07 10:30:05,U101,D205,192.168.1.20,Logout,VPN,-,Success
+2026-10-07 10:32:41,U104,D208,192.168.1.23,File_Access,FileServer,Team_Report.docx,Success
+2026-10-07 10:35:16,U102,D206,192.168.1.21,Logout,VPN,-,Success
+2026-10-07 10:40:12,U105,D209,185.44.21.90,Login,VPN,-,Failed
+2026-10-07 10:40:18,U105,D209,185.44.21.90,Login,VPN,-,Failed
+2026-10-07 10:40:25,U105,D209,185.44.21.90,Login,VPN,-,Success
+2026-10-07 10:41:03,U105,D209,185.44.21.90,File_Access,FileServer,Finance_Report.pdf,Success
+2026-10-07 10:42:17,U105,D209,185.44.21.90,Privilege_Change,AdminPanel,U105_Admin,Success
+2026-10-07 10:43:05,U105,D209,185.44.21.90,File_Access,FileServer,Employee_Data.xlsx,Success
+2026-10-07 10:44:21,U105,D209,185.44.21.90,Data_Transfer,CloudStorage,Employee_Data.xlsx,Success
+2026-10-07 10:45:10,U105,D209,185.44.21.90,File_Access,FileServer,Salary_Data.xlsx,Success
+2026-10-07 10:46:32,U105,D209,185.44.21.90,Data_Transfer,CloudStorage,Salary_Data.xlsx,Success
+2026-10-07 10:48:04,U105,D209,185.44.21.90,Logout,VPN,-,Success
